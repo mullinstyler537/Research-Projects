@@ -1,81 +1,91 @@
+from tkinter import Tk, filedialog
 import cv2
 import numpy as np
+import matplotlib.pyplot as plt
 
-# -----------------------------
-# Load SEM image
-# -----------------------------
-image_path = r"C:\Users\D00456326\Desktop\Research Photos\Nanoparticles\NOCOB2.JPG"
-img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-if img is None:
-    print("Error: Image not found.")
-    exit()
-
-# -----------------------------
-# Ask for micron scale
-# -----------------------------
-micron_value = float(input("Enter the micron scale represented by the scale bar: "))
-pixel_length = float(input("Enter the number of pixels corresponding to that scale: "))
-micron_per_pixel = micron_value / pixel_length
-print(f"Micron per pixel ratio: {micron_per_pixel:.6f} μm/pixel")
-
-# -----------------------------
-# Crop bottom 10%
-# -----------------------------
-height = img.shape[0]
-img_cropped = img[:int(height * 0.9), :]
-
-# -----------------------------
-# Measuring Pass: preprocessing
-# -----------------------------
-# Minimal blur to preserve edges
-img_blur = cv2.GaussianBlur(img_cropped, (3, 3), 0)
-
-# Adaptive thresholding (invert so particles are white)
-img_thresh = cv2.adaptiveThreshold(
-    img_blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-    cv2.THRESH_BINARY_INV, 11, 2
+# --- File picker ---
+Tk().withdraw()
+image_path = filedialog.askopenfilename(
+    title="Select SEM image",
+    filetypes=[("Image files", "*.jpg *.jpeg *.png *.tif *.tiff")]
 )
 
-# Morphological opening to remove tiny noise
-kernel = np.ones((2, 2), np.uint8)
-img_thresh = cv2.morphologyEx(img_thresh, cv2.MORPH_OPEN, kernel)
+img = cv2.imread(image_path)
+if img is None:
+    raise FileNotFoundError(f"Could not read image at: {image_path}")
 
-# -----------------------------
-# Watershed to separate touching particles
-# -----------------------------
-dist_transform = cv2.distanceTransform(img_thresh, cv2.DIST_L2, 5)
-_, sure_fg = cv2.threshold(dist_transform, 0.55 * dist_transform.max(), 255, 0)
+# Optional: crop image to remove scale bar or edges
+height = img.shape[0]
+crop_height = int(height * 0.9)
+img = img[:crop_height, :]
 
-sure_fg = np.uint8(sure_fg)
-unknown = cv2.subtract(img_thresh, sure_fg)
+# --- Ask user for scale information ---
+micron_scale = float(input("Enter the scale bar length in microns: "))
+pixel_scale = float(input("Enter the corresponding pixel length: "))
 
-_, markers = cv2.connectedComponents(sure_fg)
-markers = markers + 1
-markers[unknown == 255] = 0
+nm_per_pixel = (micron_scale * 1000) / pixel_scale
 
-img_color = cv2.cvtColor(img_cropped, cv2.COLOR_GRAY2BGR)
-markers = cv2.watershed(img_color, markers)
-img_thresh[markers == -1] = 0
+# --- Preprocessing ---
+gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-# -----------------------------
-# Find contours for measuring
-# -----------------------------
-contours, _ = cv2.findContours(img_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-min_area_pixels = 5  # remove tiny noise
-contours = [c for c in contours if cv2.contourArea(c) >= min_area_pixels]
+# High contrast: threshold to detect white nanoparticles
+_, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
 
-areas_pixels = [cv2.contourArea(c) for c in contours]
-areas_microns = [a * (micron_per_pixel ** 2) for a in areas_pixels]
+# Optional: remove tiny noise
+kernel = np.ones((2,2), np.uint8)
+thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
-# -----------------------------
-# Output average area
-# -----------------------------
-if len(areas_microns) == 0:
-    print("No nanoparticles detected for measuring.")
+# --- Edge detection ---
+edges = cv2.Canny(gray, 50, 150)
+cv2.imwrite("sem_edges_debug.jpg", edges)
+
+# Convert edges to a 3-channel image for overlay
+edges_color = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+edges_color[:] = (0, 255, 0)  # color edges green
+
+# --- Find contours ---
+contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+# Filter contours by area
+min_area_px = 2  # adjust based on smallest nanoparticle
+filtered_contours = [cnt for cnt in contours if cv2.contourArea(cnt) >= min_area_px]
+
+# Draw contours on a copy of the original image
+img_with_contours = img.copy()
+for cnt in filtered_contours:
+    cv2.drawContours(img_with_contours, [cnt], -1, (0,0,255), 1)  # red contours
+
+# Overlay edges on the original image
+overlay = cv2.addWeighted(img_with_contours, 0.8, edges_color, 0.5, 0)
+cv2.imwrite("sem_edges_and_contours_overlay.jpg", overlay)
+
+# --- Calculate areas ---
+areas_px = [cv2.contourArea(cnt) for cnt in filtered_contours]
+areas_nm2 = np.array(areas_px) * (nm_per_pixel ** 2)
+areas_um2 = areas_nm2 / 1e6
+
+# --- Statistics ---
+if len(areas_um2) > 0:
+    avg_area = np.mean(areas_um2)
+    std_area = np.std(areas_um2)
 else:
-    avg_area = np.mean(areas_microns)
-    print(f"Average nanoparticle area (measuring pass): {avg_area:.4f} μm²")
+    avg_area = 0
+    std_area = 0
 
-# Optional: save visualization
-cv2.imwrite("measuring_pass.png", img_thresh)
-print("Thresholded image for measuring saved as 'measuring_pass.png'.")
+# --- Outputs ---
+cv2.imwrite("sem_nanoparticles_outlined.jpg", img_with_contours)
+
+print(f"\nDetected {len(areas_um2)} nanoparticles")
+print(f"Average area: {avg_area:.4f} µm²")
+print(f"Std. dev.:    {std_area:.4f} µm²")
+
+# --- Histogram ---
+plt.figure(figsize=(6,4))
+plt.hist(areas_um2, bins=30, color='steelblue', edgecolor='black')
+plt.xlabel("Particle area (µm²)")
+plt.ylabel("Count")
+plt.title("Nanoparticle Size Distribution")
+plt.tight_layout()
+plt.savefig("nanoparticle_size_distribution.png", dpi=300)
+# plt.show()  # comment out for automated runs
+
